@@ -1,0 +1,15 @@
+{
+  "name": "webguru-gtm-mcp",
+  "version": "0.1.0",
+  "description": "Google Tag Manager MCP Server pour Claude Desktop - Web Guru",
+  "type": "module",
+  "main": "index.js",
+  "scripts": {
+    "start": "node start-mcp.js"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.4",
+    "@supabase/supabase-js": "^2.75.0",
+    "dotenv": "^16.4.5"
+  }
+}
