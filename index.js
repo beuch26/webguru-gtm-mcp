@@ -178,22 +178,53 @@ async function gtmApi(path, options = {}) {
 
   const { accessToken } = await getGtmAccessToken(currentProjectId);
 
-  const response = await fetch(`${GTM_API_BASE}${path}`, {
-    ...options,
-    headers: {
-      Authorization: `Bearer ${accessToken}`,
-      'Content-Type': 'application/json',
-      ...(options.headers || {}),
-    },
-  });
+  // Timeout de 30s — GTM répond normalement en <2s. Au-delà c'est un hang.
+  const controller = new AbortController();
+  const timeoutMs = options.timeoutMs ?? 30000;
+  const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+
+  let response;
+  try {
+    response = await fetch(`${GTM_API_BASE}${path}`, {
+      ...options,
+      signal: controller.signal,
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+        'Content-Type': 'application/json',
+        ...(options.headers || {}),
+      },
+    });
+  } catch (e) {
+    clearTimeout(timeoutId);
+    if (e.name === 'AbortError') {
+      const err = new Error(`GTM API timeout (${timeoutMs}ms) sur ${options.method || 'GET'} ${path}`);
+      err.statusCode = 504;
+      throw err;
+    }
+    throw e;
+  }
+  clearTimeout(timeoutId);
 
   if (!response.ok) {
     const errorBody = await response.text();
     let parsed;
     try { parsed = JSON.parse(errorBody); } catch { parsed = errorBody; }
-    const err = new Error(
-      parsed?.error?.message || `GTM API ${response.status}: ${errorBody}`
-    );
+    let message = parsed?.error?.message || `GTM API ${response.status}: ${errorBody}`;
+
+    // 403 scope insuffisant — diagnostic ciblé : le token actuel a été émis
+    // avant l'ajout du scope `tagmanager.publish` côté Web Guru.
+    if (response.status === 403 && /scope/i.test(message)) {
+      message = `Scope OAuth insuffisant pour cette opération. Token actuel ne couvre pas l'action demandée.
+
+→ Solution : reconnecte Google dans Web Guru
+  (Paramètres → Intégrations → Services Google → bouton "Reconnecter").
+  Le flow OAuth utilise déjà prompt=consent + les bons scopes (depuis 2026-05-12),
+  mais ton refresh_token actuel a été émis avant et reste limité à son scope d'origine.
+
+Détail Google : ${parsed?.error?.message || errorBody}`;
+    }
+
+    const err = new Error(message);
     err.statusCode = response.status;
     err.googleError = parsed?.error;
     throw err;
@@ -293,14 +324,27 @@ function objectToParamList(obj) {
   };
 }
 
-/** Cherche un tag par nom dans le workspace courant et retourne son tagId. */
-async function findTagIdByName(wsPath, tagName) {
+/** Cherche un tag par nom dans le workspace courant et retourne le tag complet. */
+async function findTagByName(wsPath, tagName) {
   const data = await gtmApi(`${wsPath}/tags`);
   const tag = (data?.tag || []).find((t) => t.name === tagName);
   if (!tag) {
     throw new Error(`Tag introuvable : "${tagName}". Vérifie la liste via list_tags.`);
   }
+  return tag;
+}
+
+/** Cherche un tag par nom dans le workspace courant et retourne son tagId. */
+async function findTagIdByName(wsPath, tagName) {
+  const tag = await findTagByName(wsPath, tagName);
   return tag.tagId;
+}
+
+/** Extrait le measurement_id (G-XXX) d'un tag GA4 Configuration (googtag). */
+function extractMeasurementId(tag) {
+  if (!tag || tag.type !== 'googtag') return null;
+  const param = (tag.parameter || []).find((p) => p.key === 'tagId');
+  return param?.value || null;
 }
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -829,13 +873,13 @@ async function handleCreateGa4ConfigTag(args) {
     { type: 'template', key: 'tagId', value: String(args.measurement_id) },
   ];
 
-  // Config settings → LIST de MAP
+  // Config settings → LIST de MAP (clé GTM v2 : configSettingsTable, c'est le bon nom pour googtag)
   if (args.config_settings && Object.keys(args.config_settings).length > 0) {
     parameter.push({ key: 'configSettingsTable', ...objectToParamList(args.config_settings) });
   }
-  // User properties → LIST de MAP
+  // User properties → LIST de MAP (clé GTM v2 : userProperties pour googtag aussi)
   if (args.user_properties && Object.keys(args.user_properties).length > 0) {
-    parameter.push({ key: 'userPropertiesTable', ...objectToParamList(args.user_properties) });
+    parameter.push({ key: 'userProperties', ...objectToParamList(args.user_properties) });
   }
 
   const tagResource = {
@@ -862,23 +906,28 @@ async function handleCreateGa4EventTag(args) {
   currentContext = ctx;
   const wsPath = workspacePath(ctx);
 
-  // Résout config_tag_name → tagId
-  const configTagId = await findTagIdByName(wsPath, args.config_tag_name);
+  // Le tag GA4 Event (gaawe) attend le measurement_id directement dans
+  // `measurementIdOverride`. La tagReference seule ne suffit plus depuis la
+  // refonte 2024 — l'API renvoie "measurementIdOverride empty".
+  // On charge donc le config tag et on extrait son measurement_id.
+  const configTag = await findTagByName(wsPath, args.config_tag_name);
+  const measurementId = extractMeasurementId(configTag);
+  if (!measurementId) {
+    throw new Error(
+      `Tag "${args.config_tag_name}" trouvé (tagId ${configTag.tagId}) mais ce n'est pas un Google Tag (type=googtag) avec measurement_id renseigné.`
+    );
+  }
 
   const parameter = [
-    {
-      type: 'tagReference',
-      key: 'measurementId',
-      value: String(configTagId),
-    },
+    { type: 'template', key: 'measurementIdOverride', value: measurementId },
     { type: 'template', key: 'eventName', value: String(args.event_name) },
   ];
 
   if (args.event_parameters && Object.keys(args.event_parameters).length > 0) {
-    parameter.push({ key: 'eventSettingsTable', ...objectToParamList(args.event_parameters) });
+    parameter.push({ key: 'eventParameters', ...objectToParamList(args.event_parameters) });
   }
   if (args.user_properties && Object.keys(args.user_properties).length > 0) {
-    parameter.push({ key: 'userPropertiesTable', ...objectToParamList(args.user_properties) });
+    parameter.push({ key: 'userProperties', ...objectToParamList(args.user_properties) });
   }
   if (args.send_ecommerce_data === true) {
     parameter.push({ type: 'boolean', key: 'sendEcommerceData', value: 'true' });
@@ -899,8 +948,8 @@ async function handleCreateGa4EventTag(args) {
   return {
     success: true,
     tag: { tagId: data.tagId, name: data.name, type: data.type, firingTriggerId: data.firingTriggerId },
-    referenced_config_tag: { name: args.config_tag_name, tagId: configTagId },
-    message: `Event Tag GA4 "${data.name}" créé (tagId: ${data.tagId}, event_name: ${args.event_name}).`,
+    referenced_config_tag: { name: args.config_tag_name, tagId: configTag.tagId, measurement_id: measurementId },
+    message: `Event Tag GA4 "${data.name}" créé (tagId: ${data.tagId}, event_name: ${args.event_name}, measurement_id: ${measurementId}).`,
   };
 }
 
@@ -957,21 +1006,42 @@ async function handleCreateClickLinkTrigger(args) {
     }
   }
 
-  const filter = (args.filters || []).map(f => buildFilter(f.variable, f.match, f.value, f.negate));
+  // GTM distingue 2 listes de filtres :
+  // - autoEventFilter : variables disponibles uniquement à l'événement (CLICK_*, FORM_*, ELEMENT_*)
+  // - filter : variables globales (PAGE_*, REFERRER, etc.)
+  // Mélanger les deux dans `filter` provoque un hang côté API.
+  const AUTO_EVENT_PREFIX = /^(CLICK_|FORM_|ELEMENT_|LINK_|HISTORY_|TIMER_|SCROLL_|YOUTUBE_)/;
+  const autoEventFilter = [];
+  const filter = [];
+  for (const f of (args.filters || [])) {
+    const built = buildFilter(f.variable, f.match, f.value, f.negate);
+    if (AUTO_EVENT_PREFIX.test(f.variable)) autoEventFilter.push(built);
+    else filter.push(built);
+  }
 
   const triggerResource = {
     name: args.name,
     type: 'linkClick',
     waitForTags: { type: 'boolean', value: String(args.wait_for_tags === true) },
     checkValidation: { type: 'boolean', value: String(args.check_validation === true) },
-    filter,
   };
+  if (args.wait_for_tags === true) {
+    triggerResource.waitForTagsTimeout = { type: 'template', value: String(args.wait_for_tags_timeout_ms || 2000) };
+  }
+  if (autoEventFilter.length > 0) triggerResource.autoEventFilter = autoEventFilter;
+  if (filter.length > 0) triggerResource.filter = filter;
 
   const data = await gtmApi(`${wsPath}/triggers`, { method: 'POST', body: JSON.stringify(triggerResource) });
   return {
     success: true,
-    trigger: { triggerId: data.triggerId, name: data.name, type: data.type, filter: data.filter },
-    message: `Trigger Link Click "${data.name}" créé (triggerId: ${data.triggerId}, ${filter.length} filtre(s)).`,
+    trigger: {
+      triggerId: data.triggerId,
+      name: data.name,
+      type: data.type,
+      autoEventFilter: data.autoEventFilter,
+      filter: data.filter,
+    },
+    message: `Trigger Link Click "${data.name}" créé (triggerId: ${data.triggerId}, ${autoEventFilter.length} filtre(s) auto-event + ${filter.length} filtre(s) globaux).`,
   };
 }
 
