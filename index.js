@@ -213,6 +213,97 @@ function workspacePath(ctx) {
 }
 
 // ───────────────────────────────────────────────────────────────────────────
+// HELPERS PARTAGÉS (variables built-in, consent, references de tags)
+// ───────────────────────────────────────────────────────────────────────────
+
+/**
+ * Mapping des built-in variables GTM : UPPER_SNAKE_CASE (user-friendly)
+ * → lowerCamelCase attendu par l'API (?type=xxx).
+ * Doc: https://developers.google.com/tag-platform/tag-manager/api/v2/reference/accounts/containers/workspaces/built_in_variables
+ */
+const BUILTIN_VAR_MAP = {
+  PAGE_URL: 'pageUrl', PAGE_HOSTNAME: 'pageHostname', PAGE_PATH: 'pagePath', REFERRER: 'referrer',
+  EVENT: 'event',
+  CLICK_ELEMENT: 'clickElement', CLICK_CLASSES: 'clickClasses', CLICK_ID: 'clickId',
+  CLICK_TARGET: 'clickTarget', CLICK_URL: 'clickUrl', CLICK_TEXT: 'clickText',
+  FORM_ELEMENT: 'formElement', FORM_CLASSES: 'formClasses', FORM_ID: 'formId',
+  FORM_TARGET: 'formTarget', FORM_URL: 'formUrl', FORM_TEXT: 'formText',
+  HISTORY_SOURCE: 'historySource', NEW_HISTORY_FRAGMENT: 'newHistoryFragment',
+  OLD_HISTORY_FRAGMENT: 'oldHistoryFragment', NEW_HISTORY_STATE: 'newHistoryState',
+  OLD_HISTORY_STATE: 'oldHistoryState', HISTORY_CHANGE_SOURCE: 'historyChangeSource',
+  ERROR_MESSAGE: 'errorMessage', ERROR_URL: 'errorUrl', ERROR_LINE: 'errorLine',
+  DEBUG_MODE: 'debugMode',
+  CONTAINER_ID: 'containerId', CONTAINER_VERSION: 'containerVersion',
+  RANDOM_NUMBER: 'randomNumber', HTML_ID: 'htmlId',
+};
+
+/** Nom de référence dans les triggers/tags (ex. CLICK_URL → "{{Click URL}}"). */
+const VAR_REF_MAP = {
+  PAGE_URL: '{{Page URL}}', PAGE_HOSTNAME: '{{Page Hostname}}', PAGE_PATH: '{{Page Path}}',
+  REFERRER: '{{Referrer}}', EVENT: '{{Event}}',
+  CLICK_ELEMENT: '{{Click Element}}', CLICK_CLASSES: '{{Click Classes}}', CLICK_ID: '{{Click ID}}',
+  CLICK_TARGET: '{{Click Target}}', CLICK_URL: '{{Click URL}}', CLICK_TEXT: '{{Click Text}}',
+  FORM_ELEMENT: '{{Form Element}}', FORM_CLASSES: '{{Form Classes}}', FORM_ID: '{{Form ID}}',
+  FORM_TARGET: '{{Form Target}}', FORM_URL: '{{Form URL}}', FORM_TEXT: '{{Form Text}}',
+};
+
+/** Mapping enum filter_match → type GTM (lowercase per API). */
+const FILTER_TYPE_MAP = {
+  EQUALS: 'equals', CONTAINS: 'contains', STARTS_WITH: 'startsWith', ENDS_WITH: 'endsWith',
+  MATCHES_REGEX: 'matchRegex',
+};
+
+/** Construit un filter GTM standard (variable, match, value). */
+function buildFilter(variable, match, value, negate = false) {
+  const filter = {
+    type: FILTER_TYPE_MAP[match] || 'equals',
+    parameter: [
+      { type: 'template', key: 'arg0', value: VAR_REF_MAP[variable] || `{{${variable}}}` },
+      { type: 'template', key: 'arg1', value: String(value) },
+    ],
+  };
+  if (negate) filter.parameter.push({ type: 'boolean', key: 'negate', value: 'true' });
+  return filter;
+}
+
+/** Construit la structure consentSettings GTM à partir d'une liste de types. */
+function buildConsentSettings(consentTypes) {
+  if (!consentTypes || consentTypes.length === 0) return undefined;
+  return {
+    consentStatus: 'needed',
+    consentType: {
+      type: 'list',
+      list: consentTypes.map((t) => ({ type: 'template', value: t })),
+    },
+  };
+}
+
+/** Convertit un object {k: v} en LIST de MAP (format event_parameters GTM). */
+function objectToParamList(obj) {
+  if (!obj || Object.keys(obj).length === 0) return undefined;
+  return {
+    type: 'list',
+    list: Object.entries(obj).map(([key, value]) => ({
+      type: 'map',
+      map: [
+        { type: 'template', key: 'name', value: String(key) },
+        { type: 'template', key: 'value', value: String(value) },
+      ],
+    })),
+  };
+}
+
+/** Cherche un tag par nom dans le workspace courant et retourne son tagId. */
+async function findTagIdByName(wsPath, tagName) {
+  const data = await gtmApi(`${wsPath}/tags`);
+  const tag = (data?.tag || []).find((t) => t.name === tagName);
+  if (!tag) {
+    throw new Error(`Tag introuvable : "${tagName}". Vérifie la liste via list_tags.`);
+  }
+  return tag.tagId;
+}
+
+// ───────────────────────────────────────────────────────────────────────────
 // TOOL DEFINITIONS
 // ───────────────────────────────────────────────────────────────────────────
 
@@ -322,6 +413,118 @@ const TOOLS = [
         version_name: { type: 'string', description: "Nom de la version (défaut: 'Auto-publish from Web Guru MCP {timestamp}')" },
         version_notes: { type: 'string', description: 'Notes de version (optionnel)' },
       },
+    },
+  },
+  // ─── NEW: Priorité 1 du brief 2026-05-24 ──────────────────────────────
+  {
+    name: 'enable_builtin_variables',
+    description: "Active une ou plusieurs built-in variables GTM (Click URL, Form ID, etc.). Indispensable avant d'utiliser ces variables dans des triggers ou tags.",
+    inputSchema: {
+      type: 'object',
+      properties: {
+        types: {
+          type: 'array',
+          description: 'Liste de variables à activer (UPPER_SNAKE_CASE).',
+          items: {
+            type: 'string',
+            enum: Object.keys(BUILTIN_VAR_MAP),
+          },
+        },
+      },
+      required: ['types'],
+    },
+  },
+  {
+    name: 'create_ga4_config_tag',
+    description: "Crée le Google Tag (= GA4 Configuration moderne, type 'googtag'). C'est le tag racine que tous les events GA4 référencent. Par défaut attaché au trigger 'Initialization - All Pages'.",
+    inputSchema: {
+      type: 'object',
+      properties: {
+        name: { type: 'string', description: 'Nom du tag. Ex: "GA4 - Configuration"' },
+        measurement_id: { type: 'string', description: 'Measurement ID GA4. Ex: "G-5XR6D1V38H"' },
+        trigger_id: { type: 'string', description: "triggerId (défaut: '2147479573' = Initialization - All Pages)" },
+        config_settings: { type: 'object', description: 'Paramètres de configuration GA4. Ex: {send_page_view: true, cookie_domain: "auto"}' },
+        user_properties: { type: 'object', description: 'User properties. Ex: {client_type: "premium"}' },
+        consent_required: { type: 'array', items: { type: 'string' }, description: "Types de consent requis (défaut: ['analytics_storage'])" },
+      },
+      required: ['name', 'measurement_id'],
+    },
+  },
+  {
+    name: 'create_ga4_event_tag',
+    description: "Crée un tag GA4 Event (type 'gaawe') référençant un config tag par son nom. Sert à tracker des events (form_submit, generate_lead, page_view custom, etc.).",
+    inputSchema: {
+      type: 'object',
+      properties: {
+        name: { type: 'string', description: 'Nom du tag. Ex: "GA4 - Event - Contact form"' },
+        event_name: { type: 'string', description: 'Nom de l\'event GA4. Ex: "generate_lead", "form_submit"' },
+        trigger_id: { type: 'string', description: 'triggerId du déclencheur qui fait fire le tag' },
+        config_tag_name: { type: 'string', description: 'Nom du config tag GA4 (résolu en tagId côté serveur)' },
+        event_parameters: { type: 'object', description: 'Paramètres event. Ex: {form_destination: "{{Form URL}}", form_id: "{{Form ID}}"}' },
+        user_properties: { type: 'object', description: 'User properties' },
+        consent_required: { type: 'array', items: { type: 'string' }, description: "Defaut: ['analytics_storage']" },
+        send_ecommerce_data: { type: 'boolean', description: 'Active e-commerce data (défaut: false)' },
+      },
+      required: ['name', 'event_name', 'trigger_id', 'config_tag_name'],
+    },
+  },
+  {
+    name: 'create_form_submission_trigger',
+    description: "Crée un trigger Form Submission. waitForTags + checkValidation actifs par défaut pour ne pas perdre l'event sur redirect.",
+    inputSchema: {
+      type: 'object',
+      properties: {
+        name: { type: 'string', description: 'Nom du trigger. Ex: "Form - Contact submit"' },
+        filter_form_url: { type: 'string', description: 'URL de la page du form. Ex: "/nous-contacter/"' },
+        filter_form_url_match: { type: 'string', enum: Object.keys(FILTER_TYPE_MAP), description: 'Défaut: CONTAINS' },
+        filter_form_id: { type: 'string', description: 'Alternative ou complément au filter_form_url' },
+        wait_for_tags: { type: 'boolean', description: 'Défaut: true' },
+        wait_for_tags_timeout_ms: { type: 'number', description: 'Défaut: 2000' },
+        check_validation: { type: 'boolean', description: 'Défaut: true' },
+      },
+      required: ['name'],
+    },
+  },
+  {
+    name: 'create_click_link_trigger',
+    description: 'Crée un trigger "Just Links" (clic sur balise <a>) avec filtres multiples (Click URL, Click Text, Click Hostname, etc.). Plusieurs filtres = AND.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        name: { type: 'string', description: 'Nom du trigger. Ex: "Click - Phone tel:"' },
+        filters: {
+          type: 'array',
+          items: {
+            type: 'object',
+            properties: {
+              variable: { type: 'string', enum: ['CLICK_URL', 'CLICK_HOSTNAME', 'CLICK_TEXT', 'CLICK_CLASSES', 'CLICK_ID', 'PAGE_URL', 'PAGE_PATH'] },
+              match: { type: 'string', enum: Object.keys(FILTER_TYPE_MAP) },
+              value: { type: 'string' },
+              negate: { type: 'boolean', description: 'Défaut: false' },
+            },
+            required: ['variable', 'match', 'value'],
+          },
+        },
+        wait_for_tags: { type: 'boolean', description: 'Défaut: false' },
+        check_validation: { type: 'boolean', description: 'Défaut: false' },
+      },
+      required: ['name', 'filters'],
+    },
+  },
+  {
+    name: 'create_auto_event_variable',
+    description: "Crée une Auto-Event Variable (type 'aev') — pour extraire des bouts de Click URL / Form URL (host, path, query…). Indispensable pour Click Hostname qui n'est pas dispo en built-in.",
+    inputSchema: {
+      type: 'object',
+      properties: {
+        name: { type: 'string', description: 'Nom. Ex: "Click Hostname"' },
+        source_var: { type: 'string', enum: ['CLICK_URL', 'FORM_URL'], description: 'Variable source' },
+        component: { type: 'string', enum: ['URL', 'HOST', 'PORT', 'PATH', 'QUERY', 'FRAGMENT', 'PROTOCOL', 'IS_OUTBOUND'], description: 'Composant à extraire' },
+        strip_www: { type: 'boolean', description: 'Si component=HOST, retire www. (défaut: true)' },
+        query_key: { type: 'string', description: 'Si component=QUERY, clé du paramètre à extraire' },
+        default_value: { type: 'string', description: 'Valeur si extraction échoue' },
+      },
+      required: ['name', 'source_var', 'component'],
     },
   },
 ];
@@ -586,6 +789,231 @@ async function handleCreateAdsConversionTag(args) {
   };
 }
 
+// ─── NEW Priorité 1 du brief 2026-05-24 ────────────────────────────────
+
+async function handleEnableBuiltinVariables(args) {
+  const ctx = await loadProjectContext(currentProjectId);
+  currentContext = ctx;
+  const wsPath = workspacePath(ctx);
+
+  const results = [];
+  for (const type of args.types || []) {
+    const apiType = BUILTIN_VAR_MAP[type];
+    if (!apiType) {
+      results.push({ type, status: 'unknown' });
+      continue;
+    }
+    try {
+      await gtmApi(`${wsPath}/built_in_variables?type=${apiType}`, { method: 'POST' });
+      results.push({ type, status: 'enabled' });
+    } catch (e) {
+      if (e.statusCode === 409) {
+        results.push({ type, status: 'already_enabled' });
+      } else {
+        results.push({ type, status: 'failed', error: e.message });
+      }
+    }
+  }
+  return { success: true, results };
+}
+
+async function handleCreateGa4ConfigTag(args) {
+  const ctx = await loadProjectContext(currentProjectId);
+  currentContext = ctx;
+  const wsPath = workspacePath(ctx);
+
+  // Trigger Initialization - All Pages = 2147479573 par défaut
+  const triggerId = args.trigger_id || '2147479573';
+
+  const parameter = [
+    { type: 'template', key: 'tagId', value: String(args.measurement_id) },
+  ];
+
+  // Config settings → LIST de MAP
+  if (args.config_settings && Object.keys(args.config_settings).length > 0) {
+    parameter.push({ key: 'configSettingsTable', ...objectToParamList(args.config_settings) });
+  }
+  // User properties → LIST de MAP
+  if (args.user_properties && Object.keys(args.user_properties).length > 0) {
+    parameter.push({ key: 'userPropertiesTable', ...objectToParamList(args.user_properties) });
+  }
+
+  const tagResource = {
+    name: args.name,
+    type: 'googtag',
+    parameter,
+    firingTriggerId: [String(triggerId)],
+  };
+
+  const consentTypes = args.consent_required ?? ['analytics_storage'];
+  const consentSettings = buildConsentSettings(consentTypes);
+  if (consentSettings) tagResource.consentSettings = consentSettings;
+
+  const data = await gtmApi(`${wsPath}/tags`, { method: 'POST', body: JSON.stringify(tagResource) });
+  return {
+    success: true,
+    tag: { tagId: data.tagId, name: data.name, type: data.type, firingTriggerId: data.firingTriggerId },
+    message: `Config Tag GA4 "${data.name}" créé (tagId: ${data.tagId}). Référence-le dans des Event tags via config_tag_name="${data.name}".`,
+  };
+}
+
+async function handleCreateGa4EventTag(args) {
+  const ctx = await loadProjectContext(currentProjectId);
+  currentContext = ctx;
+  const wsPath = workspacePath(ctx);
+
+  // Résout config_tag_name → tagId
+  const configTagId = await findTagIdByName(wsPath, args.config_tag_name);
+
+  const parameter = [
+    {
+      type: 'tagReference',
+      key: 'measurementId',
+      value: String(configTagId),
+    },
+    { type: 'template', key: 'eventName', value: String(args.event_name) },
+  ];
+
+  if (args.event_parameters && Object.keys(args.event_parameters).length > 0) {
+    parameter.push({ key: 'eventSettingsTable', ...objectToParamList(args.event_parameters) });
+  }
+  if (args.user_properties && Object.keys(args.user_properties).length > 0) {
+    parameter.push({ key: 'userPropertiesTable', ...objectToParamList(args.user_properties) });
+  }
+  if (args.send_ecommerce_data === true) {
+    parameter.push({ type: 'boolean', key: 'sendEcommerceData', value: 'true' });
+  }
+
+  const tagResource = {
+    name: args.name,
+    type: 'gaawe',
+    parameter,
+    firingTriggerId: [String(args.trigger_id)],
+  };
+
+  const consentTypes = args.consent_required ?? ['analytics_storage'];
+  const consentSettings = buildConsentSettings(consentTypes);
+  if (consentSettings) tagResource.consentSettings = consentSettings;
+
+  const data = await gtmApi(`${wsPath}/tags`, { method: 'POST', body: JSON.stringify(tagResource) });
+  return {
+    success: true,
+    tag: { tagId: data.tagId, name: data.name, type: data.type, firingTriggerId: data.firingTriggerId },
+    referenced_config_tag: { name: args.config_tag_name, tagId: configTagId },
+    message: `Event Tag GA4 "${data.name}" créé (tagId: ${data.tagId}, event_name: ${args.event_name}).`,
+  };
+}
+
+async function handleCreateFormSubmissionTrigger(args) {
+  const ctx = await loadProjectContext(currentProjectId);
+  currentContext = ctx;
+  const wsPath = workspacePath(ctx);
+
+  // Active les built-in nécessaires
+  for (const v of ['FORM_URL', 'FORM_ID', 'FORM_ELEMENT']) {
+    try {
+      await gtmApi(`${wsPath}/built_in_variables?type=${BUILTIN_VAR_MAP[v]}`, { method: 'POST' });
+    } catch (e) { if (e.statusCode !== 409) console.error(`⚠️ ${v}: ${e.message}`); }
+  }
+
+  // Filtres
+  const filter = [];
+  if (args.filter_form_url) {
+    filter.push(buildFilter('FORM_URL', args.filter_form_url_match || 'CONTAINS', args.filter_form_url));
+  }
+  if (args.filter_form_id) {
+    filter.push(buildFilter('FORM_ID', 'EQUALS', args.filter_form_id));
+  }
+
+  const triggerResource = {
+    name: args.name,
+    type: 'formSubmission',
+    waitForTags: { type: 'boolean', value: String(args.wait_for_tags !== false) },
+    waitForTagsTimeout: { type: 'template', value: String(args.wait_for_tags_timeout_ms || 2000) },
+    checkValidation: { type: 'boolean', value: String(args.check_validation !== false) },
+  };
+  if (filter.length > 0) triggerResource.filter = filter;
+
+  const data = await gtmApi(`${wsPath}/triggers`, { method: 'POST', body: JSON.stringify(triggerResource) });
+  return {
+    success: true,
+    trigger: { triggerId: data.triggerId, name: data.name, type: data.type },
+    message: `Trigger Form Submission "${data.name}" créé (triggerId: ${data.triggerId}).`,
+  };
+}
+
+async function handleCreateClickLinkTrigger(args) {
+  const ctx = await loadProjectContext(currentProjectId);
+  currentContext = ctx;
+  const wsPath = workspacePath(ctx);
+
+  // Active les built-in CLICK_* nécessaires
+  const usedVars = [...new Set((args.filters || []).map(f => f.variable))];
+  for (const v of usedVars) {
+    if (BUILTIN_VAR_MAP[v]) {
+      try {
+        await gtmApi(`${wsPath}/built_in_variables?type=${BUILTIN_VAR_MAP[v]}`, { method: 'POST' });
+      } catch (e) { if (e.statusCode !== 409) console.error(`⚠️ ${v}: ${e.message}`); }
+    }
+  }
+
+  const filter = (args.filters || []).map(f => buildFilter(f.variable, f.match, f.value, f.negate));
+
+  const triggerResource = {
+    name: args.name,
+    type: 'linkClick',
+    waitForTags: { type: 'boolean', value: String(args.wait_for_tags === true) },
+    checkValidation: { type: 'boolean', value: String(args.check_validation === true) },
+    filter,
+  };
+
+  const data = await gtmApi(`${wsPath}/triggers`, { method: 'POST', body: JSON.stringify(triggerResource) });
+  return {
+    success: true,
+    trigger: { triggerId: data.triggerId, name: data.name, type: data.type, filter: data.filter },
+    message: `Trigger Link Click "${data.name}" créé (triggerId: ${data.triggerId}, ${filter.length} filtre(s)).`,
+  };
+}
+
+async function handleCreateAutoEventVariable(args) {
+  const ctx = await loadProjectContext(currentProjectId);
+  currentContext = ctx;
+  const wsPath = workspacePath(ctx);
+
+  // varType = source du AEV
+  const varType = args.source_var === 'FORM_URL' ? 'FORM' : 'CLICK';
+  const sourceRefMap = { CLICK_URL: 'CLICK_URL', FORM_URL: 'FORM' };
+
+  const parameter = [
+    { type: 'template', key: 'varType', value: sourceRefMap[args.source_var] || 'CLICK_URL' },
+    { type: 'template', key: 'component', value: String(args.component) },
+  ];
+
+  if (args.component === 'HOST' && args.strip_www !== false) {
+    parameter.push({ type: 'boolean', key: 'stripWww', value: 'true' });
+  }
+  if (args.component === 'QUERY' && args.query_key) {
+    parameter.push({ type: 'template', key: 'queryKey', value: String(args.query_key) });
+  }
+  if (args.default_value) {
+    parameter.push({ type: 'template', key: 'defaultValue', value: String(args.default_value) });
+    parameter.push({ type: 'boolean', key: 'setDefaultValue', value: 'true' });
+  }
+
+  const varResource = {
+    name: args.name,
+    type: 'aev',
+    parameter,
+  };
+
+  const data = await gtmApi(`${wsPath}/variables`, { method: 'POST', body: JSON.stringify(varResource) });
+  return {
+    success: true,
+    variable: { variableId: data.variableId, name: data.name, type: data.type },
+    message: `Variable Auto-Event "${data.name}" créée (variableId: ${data.variableId}). Référence via {{${data.name}}}.`,
+  };
+}
+
 async function handlePublishWorkspace(args) {
   const ctx = await loadProjectContext(currentProjectId);
   currentContext = ctx;
@@ -688,6 +1116,24 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         break;
       case 'create_ads_conversion_tag':
         result = await handleCreateAdsConversionTag(args);
+        break;
+      case 'enable_builtin_variables':
+        result = await handleEnableBuiltinVariables(args);
+        break;
+      case 'create_ga4_config_tag':
+        result = await handleCreateGa4ConfigTag(args);
+        break;
+      case 'create_ga4_event_tag':
+        result = await handleCreateGa4EventTag(args);
+        break;
+      case 'create_form_submission_trigger':
+        result = await handleCreateFormSubmissionTrigger(args);
+        break;
+      case 'create_click_link_trigger':
+        result = await handleCreateClickLinkTrigger(args);
+        break;
+      case 'create_auto_event_variable':
+        result = await handleCreateAutoEventVariable(args);
         break;
       case 'publish_workspace':
         result = await handlePublishWorkspace(args);
