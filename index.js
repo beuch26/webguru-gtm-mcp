@@ -51,6 +51,57 @@ let currentContext = null; // { accountId, containerId, containerName, publicId,
 
 const GTM_API_BASE = 'https://tagmanager.googleapis.com/tagmanager/v2';
 
+// Cache du workspaceId resolu cote API GTM, par (accountId|containerId).
+// TTL court : 60s. Suffisant pour eviter de spammer l'API a chaque ecriture
+// mais assez court pour reagir vite si le workspace bouge cote GTM
+// (ex : apres publish, GTM cree un nouveau Default Workspace avec un id
+// incremente, l'ancien etant marque submitted).
+const workspaceCache = new Map(); // key = `${accountId}|${containerId}` → { id, name, expiresAt }
+const WORKSPACE_CACHE_TTL_MS = 60_000;
+
+/**
+ * Resout le Default Workspace actif d'un container GTM via l'API.
+ * Strategie :
+ *  1. Liste les workspaces du container
+ *  2. Prend celui nomme exactement "Default Workspace" si present (cas standard)
+ *  3. Sinon prend le premier de la liste (cas custom)
+ *  4. Cache le resultat 60s pour eviter le spam
+ *
+ * Si l'appel API echoue, retourne null → fallback sur le workspaceId stocke
+ * en BDD (qui peut etre obsolete si le container vient d'etre publie).
+ */
+async function resolveCurrentWorkspace(accountId, containerId, accessToken) {
+  const key = `${accountId}|${containerId}`;
+  const cached = workspaceCache.get(key);
+  if (cached && cached.expiresAt > Date.now()) {
+    return { workspaceId: cached.id, workspaceName: cached.name };
+  }
+
+  try {
+    const url = `${GTM_API_BASE}/accounts/${accountId}/containers/${containerId}/workspaces`;
+    const resp = await fetch(url, {
+      headers: { Authorization: `Bearer ${accessToken}` },
+    });
+    if (!resp.ok) return null;
+    const data = await resp.json();
+    const list = data.workspace || [];
+    if (list.length === 0) return null;
+
+    // Priorite : "Default Workspace" nomme strictement, sinon le premier.
+    const def = list.find((w) => w.name === 'Default Workspace') || list[0];
+    const resolved = { workspaceId: def.workspaceId, workspaceName: def.name };
+    workspaceCache.set(key, { ...resolved, id: resolved.workspaceId, name: resolved.workspaceName, expiresAt: Date.now() + WORKSPACE_CACHE_TTL_MS });
+    return resolved;
+  } catch {
+    return null;
+  }
+}
+
+/** Invalide le cache de workspace (a appeler apres un publish reussi). */
+function invalidateWorkspaceCache(accountId, containerId) {
+  workspaceCache.delete(`${accountId}|${containerId}`);
+}
+
 // ───────────────────────────────────────────────────────────────────────────
 // SUPABASE : lire le projet + le token
 // ───────────────────────────────────────────────────────────────────────────
@@ -141,6 +192,22 @@ async function getGtmAccessToken(projectId) {
       p_scope: tokenRow.scope,
       p_metadata: tokenRow.metadata,
     });
+  }
+
+  // Resolution dynamique du workspaceId actif cote GTM (cache 60s). Apres un
+  // publish, GTM cree un nouveau Default Workspace avec un id incremente, et
+  // l'ancien est marque "submitted". Le workspaceId stocke en BDD peut donc
+  // etre obsolete a tout moment → on resout systematiquement via l'API.
+  // Fallback : si l'API echoue, on garde le workspaceId stocke.
+  if (ctx.accountId && ctx.containerId) {
+    const resolved = await resolveCurrentWorkspace(ctx.accountId, ctx.containerId, accessToken);
+    if (resolved) {
+      if (resolved.workspaceId !== ctx.workspaceId) {
+        console.error(`📌 [GTM] Workspace resolu via API : ${resolved.workspaceId} (${resolved.workspaceName}). Stocke en BDD : ${ctx.workspaceId}.`);
+      }
+      ctx.workspaceId = resolved.workspaceId;
+      ctx.workspaceName = resolved.workspaceName;
+    }
   }
 
   return { accessToken, refreshToken: tokenRow.refresh_token, ctx };
@@ -391,6 +458,20 @@ const TOOLS = [
       properties: {
         account_id: { type: 'string', description: 'accountId (optionnel, par défaut celui du projet)' },
         container_id: { type: 'string', description: 'containerId (optionnel, par défaut celui du projet)' },
+      },
+    },
+  },
+  {
+    name: 'create_workspace',
+    description: "Crée un nouveau workspace dans un container GTM. Utile pour bosser dans un workspace dédié (ex: 'webguru-mcp', 'experiments') plutôt que le Default Workspace partagé. Note : depuis 2025-04 Google limite les comptes gratuits à 3 workspaces concurrents, supprimer un workspace inutilisé via l'UI GTM si besoin.",
+    inputSchema: {
+      type: 'object',
+      required: ['name'],
+      properties: {
+        name: { type: 'string', description: 'Nom du nouveau workspace (ex: "webguru-mcp")' },
+        description: { type: 'string', description: 'Description optionnelle' },
+        account_id: { type: 'string', description: 'accountId (par défaut celui du projet)' },
+        container_id: { type: 'string', description: 'containerId (par défaut celui du projet)' },
       },
     },
   },
@@ -667,6 +748,40 @@ async function handleListWorkspaces(args) {
       description: w.description,
       path: w.path,
     })),
+  };
+}
+
+async function handleCreateWorkspace(args) {
+  if (!args?.name) throw new Error('Le param "name" est requis pour créer un workspace.');
+
+  const ctx = currentContext || (currentProjectId ? await loadProjectContext(currentProjectId) : null);
+  const accountId = args.account_id || ctx?.accountId;
+  const containerId = args.container_id || ctx?.containerId;
+  if (!accountId || !containerId) {
+    throw new Error('account_id et container_id requis (ou GTM non sélectionné pour le projet)');
+  }
+
+  const body = { name: args.name };
+  if (args.description) body.description = args.description;
+
+  const data = await gtmApi(`/accounts/${accountId}/containers/${containerId}/workspaces`, {
+    method: 'POST',
+    body: JSON.stringify(body),
+  });
+
+  // Invalide notre cache : le nouveau workspace pourrait devenir le defaut
+  // resolu si l'utilisateur veut bosser dedans en priorite.
+  invalidateWorkspaceCache(accountId, containerId);
+
+  return {
+    success: true,
+    workspace: {
+      workspaceId: data?.workspaceId,
+      name: data?.name,
+      description: data?.description,
+      path: data?.path,
+    },
+    note: 'Le nouveau workspace est créé. Pour y travailler en priorité depuis ce MCP, le Default Workspace continuera d\'être pris par défaut (résolution dynamique via API). Pour basculer, modifie settings.workspaceId du projet ou demande une option future.',
   };
 }
 
@@ -1119,6 +1234,12 @@ async function handlePublishWorkspace(args) {
     throw err;
   }
 
+  // Apres publish, GTM marque l'ancien workspace "submitted" et cree un
+  // nouveau Default Workspace avec un id incremente. On invalide notre cache
+  // pour que la prochaine ecriture re-resolve via API (sinon on tape sur le
+  // workspace mort → "Workspace is already submitted").
+  invalidateWorkspaceCache(ctx.accountId, ctx.containerId);
+
   return {
     success: true,
     version: {
@@ -1171,6 +1292,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         break;
       case 'list_workspaces':
         result = await handleListWorkspaces(args);
+        break;
+      case 'create_workspace':
+        result = await handleCreateWorkspace(args);
         break;
       case 'list_tags':
         result = await handleListTags();
